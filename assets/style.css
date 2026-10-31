@@ -1,0 +1,58 @@
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, sans-serif;
+}
+body {
+  margin: 0 auto;
+  padding: 1rem;
+  max-width: 1400px;
+  background: #f5f7fa;
+  color: #192430;
+}
+body.dark {
+  background: #141b23;
+  color: #e5edf6;
+}
+header,
+nav,
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 1rem;
+}
+header {
+  justify-content: space-between;
+}
+a {
+  color: #239ed9;
+}
+button,
+select {
+  font: inherit;
+  padding: 0.5rem;
+  cursor: pointer;
+}
+main {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 520px), 1fr));
+  gap: 1rem;
+}
+.chart {
+  border: 1px solid #758494;
+  border-radius: 0.5rem;
+  padding: 1rem;
+  min-width: 0;
+}
+h2 {
+  font-size: 1rem;
+  overflow-wrap: anywhere;
+}
+canvas {
+  width: 100%;
+  height: auto;
+}
+footer {
+  margin-top: 2rem;
+  font-size: 0.85rem;
+}

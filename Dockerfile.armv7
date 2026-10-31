@@ -1,0 +1,30 @@
+# No target RUN: explicit QEMU is confined to the disposable amd64 checks stage.
+FROM --platform=linux/arm/v7 debian:bookworm-slim@sha256:1200543cedc12abb00287c17870c518912ec271d0ed2c31b3623841e752c5d72 AS target-root
+
+FROM --platform=linux/amd64 rust:1.99-bookworm@sha256:0097cc72a939f26665ab11380e995aa9476735ec9516867e14ff5dfa8318b068 AS checks
+RUN apt-get update && apt-get install -y --no-install-recommends gcc-arm-linux-gnueabihf libc6-dev-armhf-cross qemu-user ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN rustup target add armv7-unknown-linux-gnueabihf
+ENV CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc \
+    CC_armv7_unknown_linux_gnueabihf=arm-linux-gnueabihf-gcc \
+    AR_armv7_unknown_linux_gnueabihf=arm-linux-gnueabihf-ar
+WORKDIR /build
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY src/ src/
+COPY assets/ assets/
+COPY tests/ tests/
+RUN cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked
+RUN cargo build --locked --release --target armv7-unknown-linux-gnueabihf
+COPY --from=target-root / /target-root/
+RUN arm-linux-gnueabihf-readelf -h target/armv7-unknown-linux-gnueabihf/release/resource-monitor | grep -F 'ARM' && arm-linux-gnueabihf-readelf -h target/armv7-unknown-linux-gnueabihf/release/resource-monitor | grep -F 'hard-float ABI' \
+    && arm-linux-gnueabihf-readelf -l target/armv7-unknown-linux-gnueabihf/release/resource-monitor | grep -F '/lib/ld-linux-armhf.so.3' \
+    && qemu-arm -L /target-root target/armv7-unknown-linux-gnueabihf/release/resource-monitor --help \
+    && mkdir /checked-data && chown 65532:65532 /checked-data
+
+FROM target-root AS runtime
+COPY --from=checks /build/target/armv7-unknown-linux-gnueabihf/release/resource-monitor /usr/local/bin/resource-monitor
+COPY --from=checks /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=checks --chown=65532:65532 /checked-data /data
+USER 65532:65532
+EXPOSE 8080 8443
+ENTRYPOINT ["/usr/local/bin/resource-monitor"]
+CMD ["agent"]

@@ -1,0 +1,30 @@
+# No target RUN: explicit QEMU is confined to the disposable amd64 checks stage.
+FROM --platform=linux/arm64 debian:bookworm-slim@sha256:7ccb8b5b60c7654f5b795d94ee7d751cd0811500803f0b09cefcd555e755a55a AS target-root
+
+FROM --platform=linux/amd64 rust:1.99-bookworm@sha256:0097cc72a939f26665ab11380e995aa9476735ec9516867e14ff5dfa8318b068 AS checks
+RUN apt-get update && apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN rustup target add aarch64-unknown-linux-gnu
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+    CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
+    AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar
+WORKDIR /build
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY src/ src/
+COPY assets/ assets/
+COPY tests/ tests/
+RUN cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked
+RUN cargo build --locked --release --target aarch64-unknown-linux-gnu
+COPY --from=target-root / /target-root/
+RUN aarch64-linux-gnu-readelf -h target/aarch64-unknown-linux-gnu/release/resource-monitor | grep -F 'AArch64' \
+    && aarch64-linux-gnu-readelf -l target/aarch64-unknown-linux-gnu/release/resource-monitor | grep -F '/lib/ld-linux-aarch64.so.1' \
+    && qemu-aarch64 -L /target-root target/aarch64-unknown-linux-gnu/release/resource-monitor --help \
+    && mkdir /checked-data && chown 65532:65532 /checked-data
+
+FROM target-root AS runtime
+COPY --from=checks /build/target/aarch64-unknown-linux-gnu/release/resource-monitor /usr/local/bin/resource-monitor
+COPY --from=checks /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=checks --chown=65532:65532 /checked-data /data
+USER 65532:65532
+EXPOSE 8080 8443
+ENTRYPOINT ["/usr/local/bin/resource-monitor"]
+CMD ["agent"]
