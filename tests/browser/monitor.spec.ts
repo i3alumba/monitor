@@ -653,3 +653,55 @@ test("mobile charts keep readable height and high-DPI resolution across resize",
     await context.close();
   }
 });
+
+test("readout uses last recorded bucket, not trailing empty intervals", async ({
+  page,
+}) => {
+  await page.route("**/api/history?**", (route) =>
+    fulfill(route, {
+      node: uid,
+      bucket_ms: 10000,
+      points: [
+        { timestamp_ms: 100000, metrics: { "cpu.used_percent": 42 } },
+        { timestamp_ms: 110000, metrics: {} },
+        { timestamp_ms: 120000, metrics: {} },
+      ],
+    }),
+  );
+  await ready(page);
+  await expect(page.getByText("Used: 42.0 %", { exact: true })).toBeVisible();
+  await expect(page.getByText(/Last recorded bucket:/)).toBeVisible();
+  const canvas = page.locator("canvas");
+  const bounds = (await canvas.boundingBox())!;
+  await page.mouse.move(bounds.x + bounds.width - 18, bounds.y + 50);
+  await expect(
+    page.getByText("Used: unavailable", { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByText(/Selected bucket:/)).toBeVisible();
+});
+
+test("explicit null or absent metric in latest record never resurrects older readout", async ({
+  page,
+}) => {
+  for (const metrics of [
+    { "cpu.used_percent": null },
+    { "memory.used_bytes": 1024 },
+  ]) {
+    await page.route("**/api/history?**", (route) =>
+      fulfill(route, {
+        node: uid,
+        bucket_ms: 10000,
+        points: [
+          { timestamp_ms: 100000, metrics: { "cpu.used_percent": 42 } },
+          { timestamp_ms: 110000, metrics },
+          { timestamp_ms: 120000, metrics: {} },
+        ],
+      }),
+    );
+    await ready(page);
+    await expect(
+      page.getByText("Used: unavailable", { exact: true }),
+    ).toBeVisible();
+    await expect(page.getByText(/Last recorded bucket:/)).toBeVisible();
+  }
+});

@@ -124,7 +124,12 @@ export function MetricChart({
       window.removeEventListener("resize", draw);
     };
   }, [points, spec, bucketMs, mode, systemMode]);
-  const point = hover === null ? points.at(-1) : points[hover];
+  // Empty time buckets are gaps, not records. Stop at the last real record even
+  // when its selected metrics are explicitly null: do not resurrect older values.
+  const lastRecorded = [...points]
+    .reverse()
+    .find((entry) => Object.keys(entry.metrics).length > 0);
+  const point = hover === null ? lastRecorded : points[hover];
   return (
     <Card variant="outlined">
       <CardContent>
@@ -176,8 +181,9 @@ export function MetricChart({
               {series.label}: {format(point?.metrics[series.key], spec.unit)}
             </Typography>
           ))}
-          {hover !== null && point && (
+          {point && (
             <Typography variant="caption">
+              {hover === null ? "Last recorded bucket: " : "Selected bucket: "}
               {new Date(point.timestamp_ms).toLocaleString()}
             </Typography>
           )}
