@@ -416,3 +416,61 @@ async fn auth_timeout_and_no_redirect() -> anyhow::Result<()> {
     task.abort();
     Ok(())
 }
+
+#[tokio::test]
+async fn embedded_frontend_nonce_mime_and_no_api_fallback() -> anyhow::Result<()> {
+    let (_dir, app, _state, server) = fixture().await?;
+    let router = web::public(app);
+    let mut nonces = Vec::new();
+    for _ in 0..2 {
+        let response = router
+            .clone()
+            .oneshot(Request::get("/").body(Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let csp = response.headers()["content-security-policy"]
+            .to_str()?
+            .to_owned();
+        assert!(csp.contains("script-src 'self';"));
+        assert!(!csp.contains("unsafe-inline"));
+        assert!(!csp.contains("unsafe-eval"));
+        let nonce = csp
+            .split("'nonce-")
+            .nth(1)
+            .unwrap()
+            .split('\'')
+            .next()
+            .unwrap();
+        assert!(nonce.len() >= 40);
+        let bytes = axum::body::to_bytes(response.into_body(), 65536).await?;
+        let html = std::str::from_utf8(&bytes)?;
+        assert!(html.contains(&format!("content=\"{nonce}\"")));
+        assert!(!html.contains("__MONITOR_STYLE_NONCE__"));
+        assert!(html.contains("/app.js"));
+        assert!(html.contains("/style.css"));
+        nonces.push(nonce.to_owned());
+    }
+    assert_ne!(nonces[0], nonces[1]);
+    for (path, mime) in [("/app.js", "text/javascript"), ("/style.css", "text/css")] {
+        let response = router
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], mime);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+    }
+    for path in [
+        "/api/unknown",
+        "/v1/kubernetes/enroll",
+        "/assets/missing.js",
+    ] {
+        let response = router
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+    server.abort();
+    Ok(())
+}

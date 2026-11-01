@@ -5,7 +5,7 @@ use crate::{
     store::Store,
 };
 use axum::{
-    extract::{DefaultBodyLimit, Query, State},
+    extract::{DefaultBodyLimit, Extension, Query, State},
     http::{header, HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
@@ -64,15 +64,34 @@ pub struct App {
     pub read_limit: Arc<Semaphore>,
     pub quota: Arc<Mutex<BTreeMap<String, Instant>>>,
 }
-async fn security(request: axum::extract::Request, next: Next) -> Response {
+#[derive(Clone)]
+struct StyleNonce(String);
+async fn security(mut request: axum::extract::Request, next: Next) -> Response {
+    use base64::Engine;
+    // UUID v4 uses the OS CSPRNG; two independent UUIDs provide 244 random bits.
+    let nonce = base64::engine::general_purpose::STANDARD.encode(
+        [
+            uuid::Uuid::new_v4().as_bytes().as_slice(),
+            uuid::Uuid::new_v4().as_bytes().as_slice(),
+        ]
+        .concat(),
+    );
+    request.extensions_mut().insert(StyleNonce(nonce.clone()));
     let mut response = next.run(request).await;
-    for (name,value) in [
-        ("cache-control","no-store"),
-        ("x-content-type-options","nosniff"),
-        ("x-frame-options","DENY"),
-        ("referrer-policy","no-referrer"),
-        ("content-security-policy","default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self' https://auth.i3alumba.ru; img-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
-    ] { response.headers_mut().insert(axum::http::HeaderName::from_static(name), axum::http::HeaderValue::from_static(value)); }
+    for (name, value) in [
+        ("cache-control", "no-store"),
+        ("x-content-type-options", "nosniff"),
+        ("x-frame-options", "DENY"),
+        ("referrer-policy", "no-referrer"),
+    ] {
+        response.headers_mut().insert(
+            axum::http::HeaderName::from_static(name),
+            axum::http::HeaderValue::from_static(value),
+        );
+    }
+    if let Ok(value) = axum::http::HeaderValue::from_str(&format!("default-src 'none'; script-src 'self'; style-src 'self' 'nonce-{nonce}'; connect-src 'self' https://auth.i3alumba.ru; img-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")) {
+        response.headers_mut().insert(header::CONTENT_SECURITY_POLICY, value);
+    }
     response
 }
 pub fn public(app: App) -> Router {
@@ -80,14 +99,21 @@ pub fn public(app: App) -> Router {
         .route("/healthz", get(|| async { "ok" }))
         .route(
             "/",
-            get(|| async { Html(include_str!("../assets/index.html")) }),
+            get(
+                |Extension(StyleNonce(nonce)): Extension<StyleNonce>| async move {
+                    Html(
+                        include_str!("../dist/index.html")
+                            .replace("__MONITOR_STYLE_NONCE__", &nonce),
+                    )
+                },
+            ),
         )
         .route(
             "/app.js",
             get(|| async {
                 (
                     [(header::CONTENT_TYPE, "text/javascript")],
-                    include_str!("../assets/app.js"),
+                    include_str!("../dist/app.js"),
                 )
             }),
         )
@@ -96,7 +122,7 @@ pub fn public(app: App) -> Router {
             get(|| async {
                 (
                     [(header::CONTENT_TYPE, "text/css")],
-                    include_str!("../assets/style.css"),
+                    include_str!("../dist/style.css"),
                 )
             }),
         )
