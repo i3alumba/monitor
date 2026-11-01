@@ -258,11 +258,17 @@ single-flight through `/api/token/refresh/` and logs out via CSRF-protected
 `/api/session/logout/` with its **current owned** refresh (including an in-flight
 rotation). No URL/storage/cookie token persistence. Sign-in remains on Dashboard.
 401/403/503 and network failure clear charts; null/missing buckets break lines.
-Axes use actual timestamps, units, ticks, per-series labels and hover values;
-the shared theme preference is the only cross-subdomain cookie. Its canonical
-`src/ui/sharedTheme.ts` and `themeStorage.ts` are byte-identical to the unified UI
-contract. Cookie preference wins; storage-denied operation falls back to memory.
-No auth tokens enter cookies, URLs or storage. Each public response has a fresh
+Axes use actual timestamps, units, ticks, per-series labels and hover values.
+Default readouts show the last recorded bucket and its explicit timestamp, skipping
+only trailing empty intervals. A real record with null or missing selected metrics
+still says unavailable: older values are never resurrected. Hovering a gap shows
+that gap, and chart paths still break across it.
+
+The shared theme preference is the only cookie this frontend writes across
+subdomains. Canonical `src/ui/sharedTheme.ts`, `themeStorage.ts` and
+`ThemeToggle.tsx` match the unified UI contract. Cookie preference wins;
+storage-denied operation falls back to memory. Monitor does not persist auth
+tokens in cookies, URLs or storage; existing legacy cookies are ignored. Each public response has a fresh
 OS-random style nonce; HTML injects it into the Emotion cache. Scripts stay
 self-hosted with no unsafe-inline/eval, external fonts or CDN. Five-minute averages
 can conceal sub-bucket gaps. Chromium tests exercise actual bundled React/MUI and
