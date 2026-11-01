@@ -9,8 +9,13 @@ operator authorization and the parent project's release gates.
 ## Automatic-node amendment (current deployment contract)
 
 Approved confined Kubernetes collectors extend the two native agents without
-reprovisioning existing PV/Secret/CA/native tokens/probes/backups. Server remains
-on alpha. Registry/history use **Node UID**, not node name. Existing native
+reprovisioning existing PV/Secret/CA/native tokens/probes/backups. The parent
+project targets the single-writer server at **beta**, using its ARM64 image with
+`serve`; native alpha/gamma agents stay amd64. Server placement and the protected
+SQLite migration are owned by the parent manifests/runbook, not this submodule.
+The original alpha Retain volume remains a frozen checkpoint, never a concurrent
+writer or an automatically current rollback copy. Registry/history use **Node UID**,
+not node name. Existing native
 alpha/gamma bearers retain their exact values and authorize only the operator's
 approved UID plus the current API Node UID. Same-name replacements get separate
 Kubernetes-provider histories; copied native labels do not exclude scheduling or
