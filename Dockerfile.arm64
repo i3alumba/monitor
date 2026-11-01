@@ -1,3 +1,11 @@
+FROM --platform=linux/amd64 node:22-bookworm-slim@sha256:9f0dde62d10e7ff7a310ecaebd66225f6b46c17e6cb778449a77b05d3541bea2 AS frontend
+WORKDIR /frontend
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY tsconfig.json vite.config.ts eslint.config.js index.html ./
+COPY src/ src/
+RUN npm run lint && npm run build
+
 # No target RUN: explicit QEMU is confined to the disposable amd64 checks stage.
 FROM --platform=linux/arm64 debian:bookworm-slim@sha256:7ccb8b5b60c7654f5b795d94ee7d751cd0811500803f0b09cefcd555e755a55a AS target-root
 
@@ -10,7 +18,7 @@ ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
 WORKDIR /build
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY src/ src/
-COPY assets/ assets/
+COPY --from=frontend /frontend/dist/ dist/
 COPY tests/ tests/
 RUN cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked
 RUN cargo build --locked --release --target aarch64-unknown-linux-gnu

@@ -1,3 +1,8 @@
 target
 *.sqlite3*
 .git
+
+node_modules
+dist
+playwright-report
+test-results

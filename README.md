@@ -3,7 +3,8 @@
 One native GNU/Linux Rust binary, two modes: `resource-monitor serve` and
 `resource-monitor agent`. No remote execution, agent listener, GPU control,
 container runtime integration, or automatic host configuration. This directory
-contains prepared code and installation templates, not an installation/deployment.
+contains application sources and installation templates; deploying them requires
+operator authorization and the parent project's release gates.
 
 ## Automatic-node amendment (current deployment contract)
 
@@ -83,8 +84,9 @@ Human `/api/nodes` now returns `{nodes:[{uid,name,lifecycle,collection,provider,
 capabilities,first_seen,last_seen,last_sample,latest}],discovery_error}`. Collection
 states pending/fresh/stale/blocked are explicit; fresh means sample age <=60s.
 `/api/history?node=<UID>&hours=1` uses UID, including retained deleted nodes. UI
-options come from this inventory, disambiguate duplicate names by UID and show
-unsupported/taint/pending/deleted states and capability limitations.
+option values preserve UID identity, including archived nodes and duplicate names.
+Option labels are exactly the node name; lifecycle, collection, provider, UID and
+capability limits are shown outside the menu.
 
 ### Confined automatic agent profile
 
@@ -130,24 +132,47 @@ Rust 1.99.1 is pinned in `rust-toolchain.toml`; the declared minimum is 1.90.
 The lockfile is required. SQLx uses bundled SQLite, a single bounded connection,
 and runtime parameterized SQL (no build-time production database).
 
+Run from this standalone repository root (or the parent's `monitor/` submodule):
+
 ```sh
-cd monitor
+# Node 22 LTS, npm; always build embedded assets before ANY cargo check/test/build.
+npm ci
+npm run lint
+npm run build
+npm run test:unit
+CHROMIUM_PATH=/usr/bin/google-chrome-stable npm run test:ui
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo test --locked thirty_day_size_and_rollup_latency -- --ignored --nocapture
-node --test tests/ui.test.cjs
-npx --yes prettier@3.6.2 --check assets/* tests/ui.test.cjs README.md
-# Build context MUST be monitor/, not the repository root.
+# Build context is this standalone repo root, not the parent stack root.
 docker build -t resource-monitor:local .
+docker build -f Dockerfile.arm64 -t resource-monitor-agent:local-arm64 .
+docker build -f Dockerfile.armv7 -t resource-monitor-agent:local-armv7 .
 docker run --rm --network none resource-monitor:local --help
 ```
 
-Docker's immutable amd64 Rust Bookworm builder was verified to contain 1.99.1.
-The final image depends on its fmt/clippy/test/release checks stage. All Rust
-sources, tests (including JS test source), manifests/lock/toolchain and embedded
-assets are explicit build inputs. Node tests run separately; Node is not in the
-runtime or Rust checks image. In environments without Docker bridge egress, local
+The standalone React 19 / TypeScript / MUI 7 / Vite frontend lives in
+`src/{api,hooks,components,pages,ui}` alongside unchanged Rust modules. Vite emits
+fixed `dist/index.html`, `dist/app.js`, and `dist/style.css`; Rust embeds them at
+compile time. `dist/` and `node_modules/` are generated and ignored. `npm run dev`
+is a local UI-only development server, not an Auth/API proxy or production server.
+Browser tests serve the built assets with strict nonce CSP and intercept every
+Auth/telemetry request; no production fixture, credentials or database is used.
+The old `node --test tests/ui.test.cjs` hook is replaced by `npm run test:unit`
+and `npm run test:ui`; parent CI must run npm build before Rust gates.
+
+All three Dockerfiles use the same immutable amd64 Node 22 Bookworm build-only
+stage (`npm ci`, lint, build), followed by the pinned Rust Bookworm checks stage.
+Node is absent from the final image. Rust fmt/clippy/tests and release compilation
+are mandatory. ARM64/ARMv7 builds preserve the cross-linker, target ELF checks,
+explicit disposable QEMU `--help` checks and matching target-root final metadata;
+no foreign-platform RUN or host binfmt/QEMU setup is required. Cross builds require
+the same apt/rustup/crates network access as before. Source inputs include package
+manifests/lock, Vite/TypeScript/ESLint configs, index, all frontend TS/TSX/CSS and
+Rust sources, tests, Cargo lock/toolchain and the three Dockerfiles.
+
+In environments without Docker bridge egress, local
 builds can use `docker build --network=host ...`; no host DNS/firewall changes are
 necessary. The runtime is Debian Bookworm slim, CA certificates, UID/GID 65532,
 with `/usr/local/bin/resource-monitor`. The binary uses GNU glibc (not musl),
@@ -223,7 +248,8 @@ Auth response is capped at 64 KiB and five seconds including streamed reads;
 no redirects, environment proxies or request-controlled destination. Four
 concurrent data operations, sixteen Auth validations and a twelve-second whole
 API deadline bound work. All public responses, including errors, are no-store.
-CSP allows local scripts/styles and exactly `https://auth.i3alumba.ru` connections;
+CSP allows local scripts, nonce-bearing Emotion styles, local CSS and exactly
+`https://auth.i3alumba.ru` connections;
 framing, MIME sniffing, referrers and inline script are disabled. No CORS bypass.
 
 The UI restores Auth `/api/session/` with credentials, uses the returned CSRF token
@@ -233,13 +259,53 @@ single-flight through `/api/token/refresh/` and logs out via CSRF-protected
 rotation). No URL/storage/cookie token persistence. Sign-in remains on Dashboard.
 401/403/503 and network failure clear charts; null/missing buckets break lines.
 Axes use actual timestamps, units, ticks, per-series labels and hover values;
-light/dark is in-memory. Five-minute averages can conceal sub-bucket gaps.
-Browser tests use a DOM/fetch fixture; real CORS/CSRF/browser acceptance is still
-an operator gate, not proven by those fixtures.
+the shared theme preference is the only cross-subdomain cookie. Its canonical
+`src/ui/sharedTheme.ts` and `themeStorage.ts` are byte-identical to the unified UI
+contract. Cookie preference wins; storage-denied operation falls back to memory.
+No auth tokens enter cookies, URLs or storage. Each public response has a fresh
+OS-random style nonce; HTML injects it into the Emotion cache. Scripts stay
+self-hosted with no unsafe-inline/eval, external fonts or CDN. Five-minute averages
+can conceal sub-bucket gaps. Chromium tests exercise actual bundled React/MUI and
+canvas under CSP with isolated network mocks; real Auth CORS/CSRF/browser HTTPS
+acceptance remains an operator gate, not proven by those fixtures.
+
+The default CPU view renders only selected-resource charts (at most four), with
+node/resource/contextual device or interface/history selectors. Network interfaces
+are not summed. Disk throughput, operations and utilization remain distinct.
+Filesystem probe capacity is not guaranteed root/PVC quota. Unsupported/null-only
+GPU telemetry shows unavailable, never fabricated zeros. Lines break at null,
+empty and irregular missing buckets; x coordinates and hover use timestamps.
+Loading, empty, denial, discovery failure, stale collection and retry states are
+explicit. Selection changes abort/invalidate old requests; every error clears
+measurements. Logout waits for in-flight session issuance/refresh rotation before
+revoking the current owned refresh and clearing local state.
 
 Existing Auth JWT access tokens are not globally invalidated by session logout;
 their normal lifetime still applies. Previously downloaded metrics cannot be
 recalled. Internal Auth HTTP and existing ingress transport are unchanged.
+
+### Local validation and limitations (React interface change)
+
+Local locked Rust checks: 30 tests passed, one expensive representative 30-day
+size/rollup test remains ignored in the default suite (not rerun for UI-only work).
+Frontend: four auth unit tests and 20 mocked Chromium tests passed. All three
+Dockerfiles built locally with their mandatory checks; ARM target ELF/ABI and
+explicit QEMU help gates passed. Final architectures were amd64/arm64/arm;
+Docker did not report Variant (ARMv7 keeps the existing hard-float/loader gates). Builds used `--network=host` after the default-network Rust component
+download timed out; this did not change host networking configuration. No images
+were pushed or deployed. Tests cover
+CSRF/bearer/session restoration, refresh single-flight and logout ownership,
+denial/network clearing, late node/time/resource/auth responses, archived/duplicate
+UID identities, resource/device selectors, empty/null/gap/irregular timestamp
+semantics, shared theme and denied storage, mobile layout, and nonce CSP.
+
+Versions intentionally match the existing Dashboard generation without a broad
+dependency upgrade. `npm audit` currently reports 12 development-tool findings
+(11 moderate, one high, including Vite dev-server advisories). Vite is build-only
+and its dev command binds loopback; the Rust runtime does not ship Node/Vite or a
+dev server. Review targeted tooling patches separately before exposing development
+servers. This is not a claim of dependency-security acceptance or production
+verification. Parent CI/build-input and ARM policy integration is required.
 
 ## Agent configuration and collection
 
@@ -393,10 +459,11 @@ remain operator responsibilities; no existing storage is reused.
 
 ## Release/rollback gates and remaining acceptance
 
-No commits, push, PRs, production rollout, DaemonSet/native installation, DNS changes,
-Auth restart or existing storage/driver/network changes are performed here.
-Follow repository feature -> dev -> master PR sequencing. Parent owns Auth,
-Dashboard, CI/image inventory, Service/Ingress/storage integration and deployment.
+Do not publish, deploy, install collectors, change DNS/network/storage/drivers or
+restart Auth without the operator's authorization. Publish changes through a
+feature branch from `dev`, a PR into `dev`, then a separate `dev` -> `master` PR.
+The parent stack pins a remotely available monitor commit as a Git submodule and
+owns Auth, Dashboard, CI/image inventory, Service/Ingress/storage and deployment.
 
 Before production, verify real Auth CORS/CSRF/rotation/revocation, dedicated TLS CA
 and certificate identity, host private connectivity, native GNU compatibility,
