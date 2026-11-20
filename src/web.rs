@@ -98,6 +98,16 @@ pub fn public(app: App) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route(
+            "/readyz",
+            get(|State(app): State<App>| async move {
+                tokio::time::timeout(Duration::from_secs(2), app.store.ready())
+                    .await
+                    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+                    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+                Ok::<_, StatusCode>("ready")
+            }),
+        )
+        .route(
             "/",
             get(
                 |Extension(StyleNonce(nonce)): Extension<StyleNonce>| async move {
@@ -262,10 +272,14 @@ async fn ingest(
     if app.kube.native.get(node) != Some(&live.uid) {
         return Err(StatusCode::FORBIDDEN);
     }
-    app.store
+    if !app
+        .store
         .assigned(&live, "native")
         .await
-        .map_err(|_| StatusCode::FORBIDDEN)?;
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
     for sample in &mut batch.samples {
         sample.node = live.uid.clone();
     }
@@ -303,10 +317,14 @@ async fn enroll(
         .authenticate(bearer(&headers)?)
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    app.store
+    if !app
+        .store
         .assigned(&node, &node.provider)
         .await
-        .map_err(|_| StatusCode::FORBIDDEN)?;
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
     quota(&app, &format!("enroll:{}", node.uid)).await?;
     Ok(Json(node.into()))
 }
@@ -323,10 +341,14 @@ async fn kubernetes_ingest(
         .authenticate(bearer(&headers)?)
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    app.store
+    if !app
+        .store
         .assigned(&node, "kubernetes")
         .await
-        .map_err(|_| StatusCode::FORBIDDEN)?;
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
     if batch.samples.is_empty()
         || batch.samples.len() > 6
         || batch
@@ -377,11 +399,7 @@ pub async fn serve() -> anyhow::Result<()> {
             url,
             limit: Arc::new(Semaphore::new(16)),
         },
-        store: Store::open(
-            &env("MONITOR_DB", "/data/monitor.sqlite3"),
-            1024 * 1024 * 1024,
-        )
-        .await?,
+        store: Store::configured(&env("MONITOR_REDIS_URL", "redis://127.0.0.1:6379/0"))?,
         tokens: Arc::new(tokens),
         ingest_limit: Arc::new(Semaphore::new(4)),
         credential_gate: Default::default(),

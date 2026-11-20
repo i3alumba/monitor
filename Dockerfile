@@ -8,6 +8,7 @@ RUN npm run lint && npm run build
 
 # GNU/glibc binary: usable on modern Arch hosts and Debian Bookworm.
 FROM rust:1.99-bookworm@sha256:0097cc72a939f26665ab11380e995aa9476735ec9516867e14ff5dfa8318b068 AS checks
+RUN apt-get update && apt-get install -y --no-install-recommends redis-server && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY src/ src/
