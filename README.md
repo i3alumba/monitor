@@ -1,7 +1,7 @@
 # Resource monitor
 
-One native GNU/Linux Rust binary, two modes: `resource-monitor serve` and
-`resource-monitor agent`. No remote execution, agent listener, GPU control,
+One native GNU/Linux Rust binary: `resource-monitor serve`, `agent`, and explicit
+operator-only `receive-snapshot` / `import-sqlite` migration commands. No remote execution, agent listener, GPU control,
 container runtime integration, or automatic host configuration. This directory
 contains application sources and installation templates; deploying them requires
 operator authorization and the parent project's release gates.
@@ -10,16 +10,16 @@ operator authorization and the parent project's release gates.
 
 Approved confined Kubernetes collectors extend the two native agents without
 reprovisioning existing PV/Secret/CA/native tokens/probes/backups. The parent
-project targets the single-writer server at **beta**, using its ARM64 image with
-`serve`; native alpha/gamma agents stay amd64. Server placement and the protected
-SQLite migration are owned by the parent manifests/runbook, not this submodule.
-The original alpha Retain volume remains a frozen checkpoint, never a concurrent
-writer or an automatically current rollback copy. Registry/history use **Node UID**,
-not node name. Existing native
-alpha/gamma bearers retain their exact values and authorize only the operator's
-approved UID plus the current API Node UID. Same-name replacements get separate
-Kubernetes-provider histories; copied native labels do not exclude scheduling or
-confer ownership. Provider conflicts are rejected, not silently merged/fallback.
+project owns alpha/amd64 placement and an **independent private ephemeral Redis**
+Deployment (not a sidecar). Monitor upgrades must not recreate Redis. Both old
+SQLite volumes remain frozen protected checkpoints; neither is mounted by the
+new server. Source preparation is not deployment authorization.
+
+Registry/history use **Node UID**, not node name. Existing native alpha/gamma
+bearers retain their exact values and authorize only the operator's approved UID
+plus the current API Node UID. Same-name replacements get separate Kubernetes
+provider histories; copied native labels do not confer ownership. Provider
+conflicts are rejected, never silently merged/fallback.
 
 Supported automatic targets: Ready Linux **amd64, arm64, ARMv7 minimum**. The parent
 provides separate matching OCI images/DaemonSets, not an amd64 image on ARM:
@@ -55,10 +55,10 @@ node writes). Failed/incomplete/malformed lists never imply deletion. API outage
 and admission-capacity errors appear as `discovery_error` in the nodes response.
 Active registry bound 64, retained bound 256; no silent active eviction. Deleted
 UIDs retain history, then metadata expires only after its history/keys are gone.
-Global maintenance deletes <=1000 rows/cycle across all nodes/tables with a fair
-persisted cursor and indexed node/time predicates. The unchanged 8GiB DB/free/WAL
-guards still apply: 64 admitted nodes is **not** a guarantee that 30 days of their
-full-resolution metrics fit. Storage pressure refuses new ingestion explicitly.
+Redis expiry removes evictable observations; bounded maintenance removes deleted
+registry/control entries only after their latest possible metric expiry. A 30-day
+TTL is an upper bound, **not guaranteed history**. Steady-state eviction is allowed;
+backend/capacity failures return 503 rather than fabricated readings.
 
 Private routes, absent from the public router:
 
@@ -134,10 +134,14 @@ read-only NVIDIA query and native approved probes remain unchanged.
 ## Build and local checks
 
 Rust 1.99.1 is pinned in `rust-toolchain.toml`; the declared minimum is 1.90.
-The lockfile is required. SQLx uses bundled SQLite, a single bounded connection,
-and runtime parameterized SQL (no build-time production database).
+The lockfile is required. Redis 7.4 is the runtime backend. SQLx/bundled SQLite
+is used only by the explicit read-only snapshot importer, never by serve/agent.
 
-Run from this standalone repository root (or the parent's `monitor/` submodule):
+Run from this standalone repository root (or the parent's `monitor/` submodule).
+Rust tests require a real disposable `redis-server` executable; absence is an
+error, not a skipped test. Set `REDIS_SERVER=/temporary/path/redis-server` if it
+is not on PATH. Docker checks stages install it; runtime images do not contain
+Redis server or a SQLite database. No existing Redis/data/production is used:
 
 ```sh
 # Node 22 LTS, npm; always build embedded assets before ANY cargo check/test/build.
@@ -149,7 +153,7 @@ CHROMIUM_PATH=/usr/bin/google-chrome-stable npm run test:ui
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
-cargo test --locked thirty_day_size_and_rollup_latency -- --ignored --nocapture
+cargo test --locked representative_thirty_day_rollup_query_is_bounded -- --nocapture
 # Build context is this standalone repo root, not the parent stack root.
 docker build -t resource-monitor:local .
 docker build -f Dockerfile.arm64 -t resource-monitor-agent:local-arm64 .
@@ -188,13 +192,14 @@ record the image digest and binary checksum before authorized installation.
 
 ## Serve configuration
 
-All configuration is environment-based; only `serve` / `agent` are CLI modes.
+Runtime configuration is environment-based. Import commands additionally require
+explicit CLI arguments; see the migration procedure below.
 
 | Variable                   | Default / contract                                                                              |
 | -------------------------- | ----------------------------------------------------------------------------------------------- |
 | `MONITOR_HTTP_ADDR`        | `0.0.0.0:8080`, public shell/read-only human API                                                |
 | `MONITOR_INGEST_ADDR`      | `0.0.0.0:8443`, separate private **TLS** listener                                               |
-| `MONITOR_DB`               | `/data/monitor.sqlite3`, plain absolute filesystem path                                         |
+| `MONITOR_REDIS_URL`        | `redis://127.0.0.1:6379/0`; private dedicated endpoint, DB 0, no credentials/query/fragment     |
 | `MONITOR_AUTH_URL`         | `http://auth:8000/api/user/`, trusted fixed configuration, exact path; never request-controlled |
 | `MONITOR_NODE_TOKENS_FILE` | `/run/monitor/nodes.json`                                                                       |
 | `MONITOR_TLS_CERT_FILE`    | `/run/monitor/tls.crt`, PEM server certificate/chain                                            |
@@ -208,7 +213,8 @@ credentials are not human credentials. Configuration/credential rotation require
 a bounded restart; credential revocation is immediate once the replacement map
 has loaded. No secrets in environment variables, image layers, URLs or logs.
 
-For an isolated local Docker run, prepare a new writable data directory, test
+For an isolated local Docker run, prepare a disposable dedicated Redis with
+`--save "" --appendonly no --maxmemory 64mb --maxmemory-policy volatile-lru`, test
 TLS certificate/key and test node map outside the repository, plus an isolated
 Auth fixture. Do not connect tests to production Auth or mount existing data:
 
@@ -217,13 +223,13 @@ docker run --rm --name monitor-local \
   --read-only --cap-drop ALL --security-opt no-new-privileges \
   --tmpfs /tmp:rw,nosuid,noexec,size=16m \
   -p 127.0.0.1:8080:8080 -p 127.0.0.1:8443:8443 \
-  -v "$PWD/local-data:/data" \
   -v "$PWD/local-runtime:/run/monitor:ro" \
   -e MONITOR_AUTH_URL=http://auth-fixture:8000/api/user/ \
+  -e MONITOR_REDIS_URL=redis://redis-fixture:6379/0 \
   --network monitor-test resource-monitor:local serve
 ```
 
-`local-data`, `local-runtime` and `monitor-test` are operator-created **new test**
+`local-runtime`, `redis-fixture` and `monitor-test` are operator-created **new test**
 resources, not committed fixtures or instructions to reuse production paths.
 The fixture must be attached to that pre-existing isolated test network. Only
 publish 8080 through production ingress; the 8443 Service is private ClusterIP,
@@ -231,7 +237,9 @@ never an Ingress route. The public router does not register `/v1/samples`.
 
 ## Human API and authorization
 
-- `GET /healthz`: public `200 ok`, no storage, node, or Auth details.
+- `GET /healthz`: public process-only `200 ok`, no storage, node, or Auth details.
+- `GET /readyz`: bounded backend/config/schema/import-state readiness; unavailable
+  or staging returns 503. Redis outages do not turn liveness into a restart loop.
 - `GET /`, `/app.js`, `/style.css`: public data-free embedded assets; no CDN.
 - `GET /api/nodes`: dynamic UID inventory described above; `latest` is null before
   ingestion. `gpu` has `uuid` (nullable) and `reason`.
@@ -295,7 +303,7 @@ Existing Auth JWT access tokens are not globally invalidated by session logout;
 their normal lifetime still applies. Previously downloaded metrics cannot be
 recalled. Internal Auth HTTP and existing ingress transport are unchanged.
 
-### Local validation and limitations (React interface change)
+### Historical validation and limitations (React interface change)
 
 Local locked Rust checks: 30 tests passed, one expensive representative 30-day
 size/rollup test remains ignored in the default suite (not rerun for UI-only work).
@@ -431,42 +439,137 @@ before body decoding, 10-second request deadline, one request/second/node.
 No decompression. Bad identity/auth 401; invalid sample 400; quota 429; storage
 pressure 503; accepted/replayed batch 204.
 
-Allowed backfill is 120 seconds and future skew 30 seconds. Dedup primary key is
-(node, boot, process, seq), committed with raw sample, server receive timestamp,
-and five-minute sum/count rollups in one FULL-synchronous WAL transaction.
-Reordered retry sequence may lag at most twelve behind current process maximum;
-duplicate identities are ignored, not added to rollups. Agent queue holds six
-samples, drops oldest on overflow and expires old data, retry backoff bounded
-at about 32 seconds with per-process jitter. No persistent secret-bearing spool;
-restarts/outages longer than the queue produce visible missing data.
+Allowed backfill is 120 seconds and future skew 30 seconds. Dedup identity is
+(node UID, boot, process, signed i64 sequence). Rust handles sequences exactly,
+including values above 2^53. Protected per-session high-water/13-position windows
+survive independent raw/rollup eviction. Reordered retries may lag at most twelve;
+already seen identities never increment surviving aggregates or reconstruct lost
+chunks. Per-UID control holds at most 1,024 sessions and 128 historical metric keys;
+metadata admission fails closed when full. Expired sessions are pruned on ingest.
 
-Schema version 2 additively migrates v1 native history to approved UIDs and records
-provider ownership; unknown newer schema refuses
-startup. Raw and rollup history retained thirty days. Every ten seconds bounded
-a globally budgeted 1000-row cleanup runs across tables/nodes, followed by a bounded-connection checkpoint;
-no routine VACUUM. Queries <=6h use raw samples, longer windows use persisted
-five-minute rollups with dynamic bucket aggregation, <=1200 points per series.
-At most 128 series/node; long-range averaging is weighted sum/count, not
-average-of-averages. Responses are bounded by point/series/key limits; five-second
-query timeout plus single-connection DB serialization; no SQL interpolation of
-user input. Null-only buckets remain null, empty buckets remain gaps.
+Redis uses the fixed versioned `monitor:v1` namespace. Registry (64 active / 256
+retained UIDs), ownership, metric-key union, session windows and import proof have
+**no TTL** and are protected by `volatile-lru`. Raw ten-second chunks (<=128
+records, <=512KiB), five-minute sum/count chunks and latest observations have
+absolute expiry at interval start +30 days (latest uses its timestamp), except
+the bounded one-time full-snapshot migration grace described below. Missing
+raw/aggregate keys become gaps; missing latest returns null, never an older
+substitute. New observations may create partial aggregates after eviction.
 
-SQLite page cap is 8 GiB at enforced 4096-byte pages. WAL auto-checkpoints every
-256 pages, retained journal target 16 MiB, ingestion refuses above a 32 MiB WAL
-high-water mark; free-space reserve is 1 GiB. These are hardcoded safety defaults,
-not unsupported environment knobs. A bounded in-flight transaction can briefly
-increase WAL beyond the target before the next guard. Busy/full/reserve pressure
-returns 503 and preserves committed history; agent retries safely. No silent
-retention shortening, deletion of database, or automatic rollback. Back up using
-SQLite's supported online backup procedure or stop only this new service before
-copying DB/WAL; never copy an active DB file alone. SIGTERM/SIGINT drains listeners
-for up to five seconds; crash reopening recovers committed WAL.
+Rust prepares bounded replacements; a Lua CAS checks all inputs including the
+active generation and staging lock before **one MSET**, then applies prevalidated
+absolute expiries. Lua isolation is not treated as rollback: there are no fallible
+incremental metric/control writes before MSET. Redis OOM rejects the write rather
+than committing a batch prefix. Batch/cardinality/overflow failures leave the
+entire previous state intact. A timed-out commit may have succeeded; retries are
+safe. Non-TTL metadata can exhaust memory; 503 remains possible with eviction.
 
-A local representative fixture (518400 node samples, 64 metrics, thirty days)
-measured 2,275,676,160 bytes DB and ~0.69s 30-day history on the implementation
-host. This is not a production latency guarantee or a filesystem quota. New
-alpha-local 10 GiB accounting allocation and actual host free-space monitoring
-remain operator responsibilities; no existing storage is reused.
+Queries <=6h enumerate deterministic raw chunks, longer queries use original
+five-minute weighted sums/counts, never averages of averages. Hours remain 1..720,
+<=1,200 points and <=128 keys. Pages <=128 chunks and a 64MiB total input budget
+bound decoding/work, plus the existing five-second API deadline. An exceeded
+budget/corrupt backend returns 503, not successful gaps; absent keys alone are
+gaps. Unsupported/null-only measurements remain null.
+
+Before every runtime operation, including existing-generation reads/discovery,
+configuration is validated: a writable primary with `save ""`, `appendonly no`, explicit
+`maxmemory >=16MiB` and `maxmemory-policy volatile-lru`. It does not reconfigure
+Redis or silently fall back to SQLite. The dedicated private endpoint must be
+policy-isolated (namespace workload writers remain trusted); no public Redis
+Service/Ingress, replication or credentials in URLs. Parent deployment owns
+actual memory headroom, Redis image pin and network policy.
+
+Monitor restart with Redis intact preserves history/dedup. Redis restart loses
+**all** in-memory observations/control/proof together: normal serve initializes
+empty, rebuilds live discovery and never reimports an old snapshot automatically.
+An independent Redis Deployment avoids monitor Recreate losing imported history.
+SIGTERM/SIGINT drains listeners for up to five seconds.
+
+### Explicit SQLite snapshot import
+
+Initial migration must import every accumulated metric row in the final fenced snapshot. Never use a cold
+start as proof of migration. Fence the source writer and create a standalone
+SQLite-aware backup. Do not copy an active DB file without its WAL, alter either
+old PVC, or give the new server a production SQLite mount. Schema **v2** is
+required: older name-keyed v1 history must first undergo its separately reviewed
+UID migration; unknown schemas fail. SQLx opens the standalone snapshot read-only,
+immutable and query-only, rejects WAL/journal sidecars, checks integrity and
+verifies SHA-256 before and after the operation.
+
+Use an isolated temporary operator importer Pod with disk emptyDir, reviewed
+monitor image, no service-account token and private Redis access. No public
+upload/import HTTP endpoint exists. Example commands (all deployment/source
+fencing still separately authorized):
+
+```sh
+# Stream a <=8GiB standalone snapshot; output must not already exist.
+resource-monitor receive-snapshot --output /staging/final.sqlite3 --sha256 "$SHA" < final.sqlite3
+# MONITOR_REDIS_URL is the exact independent target Redis instance.
+resource-monitor import-sqlite --snapshot /staging/final.sqlite3 --sha256 "$SHA" --attempt "$ATTEMPT"
+resource-monitor import-sqlite --snapshot /staging/final.sqlite3 --sha256 "$SHA" --attempt "$ATTEMPT" --resume --verify-only
+resource-monitor import-sqlite --snapshot /staging/final.sqlite3 --sha256 "$SHA" --attempt "$ATTEMPT" --resume --activate
+```
+
+`receive-snapshot` enforces `--max-bytes` (default/hard maximum 8GiB), hashes
+bounded stdin, fsyncs a mode-0600 partial and finalizes without overwriting an
+existing destination. Delete the temporary staging Pod after acceptance.
+
+The destination must initially be pristine, dedicated DB 0. **Acquire staging
+before any monitor server initializes that destination.** A non-expiring lock
+blocks readiness, discovery, maintenance, reads and ingest throughout import.
+Deterministic replacements make replay idempotent; there are no additive rollup
+replays. A crashed importer leaves staging blocked. Resume must match snapshot,
+attempt UUID, generation and Redis run_id. After confirming the old importer is
+terminated, `--resume --takeover` explicitly replaces its worker token. No TTL
+lock or automatic timeout enables a partial generation. There is no automatic
+replacement/reset/abort command; a failed attempt requires operator review.
+
+Fidelity scope is **every raw and original rollup row in the fenced snapshot**,
+without an import-time cutoff, plus all metric keys, every registry UID/provider/
+capability/lifecycle/timestamp, and registry error/cursor. Supported lifecycle
+states `present`, `deleted`, `unsupported` and `not-ready` are preserved. Raw
+receive times, identities/sequences/GPU/provider and original rollup totals/counts
+are preserved; rollups are **not** rederived from raw. Manifest `retained_rows`
+equals `rows` for every table; min/max span the full source. The compatibility
+field `retained_at_ms` records import start, not a filter.
+
+Hidden metric keys use one fixed **six-hour migration grace**, never extended
+by resume. Complete verification compares every expected value, key count and
+expiry with a fresh read-only source enumeration, plus source/schema SHA-256,
+full table counts/ranges and a canonical key checksum. Redis run_id and
+`evicted_keys` must remain unchanged; >=8MiB free Redis commit headroom is
+required. Capacity/eviction/mismatch/grace failure stops while staging remains
+blocked, never silently accepting lost history or truncating the source. Resume
+replays from the beginning in bounded chunks, not an unbounded in-memory image.
+
+Activation re-verifies everything, sets each metric expiry to **max(original
+absolute expiry, fixed grace deadline)** and atomically selects the generation.
+This bounded one-time migration exception keeps even ancient source chunks
+through initial activation/cutover acceptance. Imported dedup sessions and
+archived UID/control metadata are protected through that same deadline without
+fabricating public timestamps. Duplicate-only ingest does not shorten imported
+latest TTLs. Complete acceptance before the fixed deadline; resume does not
+extend it. New runtime observations retain the ordinary <=30-day horizon and
+API queries remain <=720 hours (ancient copied rows are not added to API ranges).
+A crash during expiry restoration requires full replay and verification again.
+Import does not deploy or issue a Kubernetes checkpoint.
+
+JSON stdout contains `import_status=verified`, `phase=verified|active`, attempt,
+generation, `redis_run_id`, initial `evicted_keys`, `verified_at_ms`,
+`verification_sha256` and the complete manifest. Successful activation stores
+that immutable JSON in protected `monitor:v1:import-proof`; later observations
+do not invalidate it. The operator binds proof to actual target Redis Pod UID,
+container ID/restart count/run_id and a fresh fenced-source heartbeat. Before
+cutover acceptance, require the same run_id/proof and no new eviction; CI without
+Redis access cannot independently attest run_id. Redis restart invalidates proof.
+
+Local real-Redis tests cover eviction/OOM, exact i64 sequences, atomic failures,
+weighted null/gap queries, registry bounds, restart empty recovery and import
+interruption/resume/mismatch/capacity/source integrity. A representative 8,640
+rollups x64 metrics thirty-day debug query measured about 1s with Redis peak
+~39MiB on the implementation host, not a production guarantee. Full protected
+production-snapshot fidelity/capacity, all three OCI builds and native ARM hardware
+remain separate release acceptance gates.
 
 ## Release/rollback gates and remaining acceptance
 
@@ -480,5 +583,5 @@ Before production, verify real Auth CORS/CSRF/rotation/revocation, dedicated TLS
 and certificate identity, host private connectivity, native GNU compatibility,
 actual nonroot device access/RTX 3060 readings, host metric comparisons, mount
 probes, 30-day bounds, restart recovery and browser HTTPS. Alpha's broken driver
-is not repaired. Rollback stops only new workload/agents and retains DB/PVC;
+is not repaired. Rollback stops only new workload/agents and retains both old DB/PVC checkpoints;
 never delete history or downgrade an unsupported schema automatically.

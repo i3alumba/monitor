@@ -32,7 +32,15 @@ child publication alone does not deploy production.
   add a build-time dependency on a sibling checkout or a new package registry.
 - Do not introduce broad host mounts, privileged collectors, GPU controls, drivers,
   runtime changes, secret logging, new credential persistence or data-reset logic.
-- Keep SQLite history/PVCs and existing identities/credentials. Production, DNS,
+- Keep old SQLite history/PVC checkpoints and existing identities/credentials.
+- Runtime history is ephemeral Redis (volatile-lru, no persistence); protected
+  ownership/dedup/cardinality state must never be evictable independently. SQLx
+  is importer-only, read-only; no fallback or automatic snapshot replay. Initial
+  migration must fully verify every fenced-snapshot metric row before activation;
+  one fixed migration grace protects source chunks and ownership/dedup metadata.
+- Rust tests require disposable real redis-server (or REDIS_SERVER); never skip
+  integration tests silently or connect them to an existing Redis/data source.
+- Production, DNS,
   networking, native installations and restarts require separate explicit scope.
 
 ## Checks

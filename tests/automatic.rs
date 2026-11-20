@@ -1,3 +1,4 @@
+mod common;
 use axum::{
     body::{to_bytes, Body},
     extract::{Request, State},
@@ -69,12 +70,12 @@ async fn handler(
         .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
 }
 async fn fixture() -> anyhow::Result<(
-    tempfile::TempDir,
+    common::Fixture,
     App,
     Arc<Mutex<Mock>>,
     tokio::task::JoinHandle<()>,
 )> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::Fixture::new().await?;
     let n = node("new-node", UID, "amd64");
     let mock = Mock {
         resources: BTreeMap::from([
@@ -129,7 +130,7 @@ async fn fixture() -> anyhow::Result<(
             ])),
             limit: Arc::new(Semaphore::new(8)),
         },
-        store: Store::open(dir.path().join("db").to_str().unwrap(), 0).await?,
+        store: Store::open(&dir.url).await?,
         tokens: Arc::new(BTreeMap::from([
             ("alpha".into(), "a".repeat(64)),
             ("gamma".into(), "b".repeat(64)),
