@@ -1,3 +1,4 @@
+mod common;
 use axum::{
     body::Body,
     http::{Request, StatusCode},
@@ -22,12 +23,12 @@ use tokio::sync::Semaphore;
 use tower::ServiceExt;
 
 async fn fixture() -> anyhow::Result<(
-    tempfile::TempDir,
+    common::Fixture,
     App,
     Arc<AtomicUsize>,
     tokio::task::JoinHandle<()>,
 )> {
-    let dir = tempfile::tempdir()?;
+    let dir = common::Fixture::new().await?;
     let state = Arc::new(AtomicUsize::new(0));
     let router = Router::new()
     .route("/api/v1/nodes/{name}",get(|axum::extract::Path(name):axum::extract::Path<String>|async move {axum::Json(serde_json::json!({"metadata":{"name":name,"uid":if name=="alpha" {"00000000-0000-0000-0000-000000000001"} else {"00000000-0000-0000-0000-000000000002"},"labels":{"kubernetes.io/os":"linux","kubernetes.io/arch":"amd64"}},"status":{"nodeInfo":{"architecture":"amd64","operatingSystem":"linux","kernelVersion":"6.1"},"conditions":[{"type":"Ready","status":"True"}]}}))}))
@@ -103,14 +104,7 @@ async fn fixture() -> anyhow::Result<(
             url: format!("http://{addr}/api/user/"),
             limit: Arc::new(Semaphore::new(2)),
         },
-        store: Store::open(
-            dir.path()
-                .join("db.sqlite3")
-                .to_str()
-                .ok_or_else(|| anyhow::anyhow!("path"))?,
-            0,
-        )
-        .await?,
+        store: Store::open(&dir.url).await?,
         tokens: Arc::new(BTreeMap::from([
             ("alpha".into(), "a".repeat(64)),
             ("gamma".into(), "b".repeat(64)),
@@ -243,7 +237,7 @@ async fn ingest_listener_identity_batch_skew_quota_and_no_public_route() -> anyh
     Ok(())
 }
 #[tokio::test]
-async fn query_bounds_and_fs_reserve() -> anyhow::Result<()> {
+async fn query_bounds_and_unregistered_ingest() -> anyhow::Result<()> {
     let (_dir, app, _state, server) = fixture().await?;
     let router = web::public(app.clone());
     for uri in [
@@ -263,8 +257,7 @@ async fn query_bounds_and_fs_reserve() -> anyhow::Result<()> {
             .await?;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
-    let mut store = app.store;
-    store.reserve = u64::MAX;
+    let store = app.store;
     assert!(store.insert(&[sample("alpha")]).await.is_err());
     assert!(store.latest("alpha").await?.is_none());
     server.abort();
@@ -471,6 +464,49 @@ async fn embedded_frontend_nonce_mime_and_no_api_fallback() -> anyhow::Result<()
             .await?;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn readiness_staging_keeps_health_live_but_blocks_data_and_ingest() -> anyhow::Result<()> {
+    let (dir, app, _state, server) = fixture().await?;
+    let public = web::public(app.clone());
+    let response = public
+        .clone()
+        .oneshot(Request::builder().uri("/readyz").body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut conn = redis::Client::open(dir.url.as_str())?
+        .get_multiplexed_async_connection()
+        .await?;
+    let _: () = redis::cmd("SET")
+        .arg(&["monitor:v1:import", "staging"])
+        .query_async(&mut conn)
+        .await?;
+    for (uri, status) in [("/healthz", 200), ("/readyz", 503), ("/api/nodes", 503)] {
+        let response = public
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("authorization", "Bearer same")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), status);
+    }
+    let response = web::private(app)
+        .oneshot(
+            Request::post("/v1/samples")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {}", "a".repeat(64)))
+                .body(Body::from(serde_json::to_vec(&Batch {
+                    samples: vec![sample("alpha")],
+                })?))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     server.abort();
     Ok(())
 }

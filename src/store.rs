@@ -1,23 +1,20 @@
 use crate::domain::{now_ms, GpuStatus, Metrics, Sample};
-use anyhow::{bail, Result};
-use serde::Serialize;
-use sqlx::{
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
-    Row, SqlitePool,
-};
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-    str::FromStr,
-    time::Duration,
-};
+use anyhow::{bail, ensure, Context, Result};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+
+pub(crate) const ROOT: &str = "monitor:v1";
+pub(crate) const ACTIVE: &str = "monitor:v1:active";
+pub(crate) const IMPORT: &str = "monitor:v1:import";
+pub(crate) const RETENTION: i64 = 30 * 86400 * 1000;
+const MAX_CHUNK_BYTES: usize = 512 * 1024;
+const MAX_QUERY_BYTES: usize = 64 * 1024 * 1024;
+
 #[derive(Clone)]
 pub struct Store {
-    pub(crate) pool: SqlitePool,
-    path: PathBuf,
-    pub reserve: u64,
+    pub(crate) client: redis::Client,
 }
-#[derive(Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Point {
     pub timestamp_ms: i64,
     pub metrics: Metrics,
@@ -30,150 +27,357 @@ pub struct History {
     pub bucket_ms: i64,
     pub points: Vec<Point>,
 }
-#[allow(clippy::useless_conversion)] // GNU statvfs field widths differ on 32-bit targets.
-pub fn available(path: &Path) -> Result<u64> {
-    let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
-    let mut info = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-    // SAFETY: name is NUL terminated; statvfs initializes info on success.
-    if unsafe { libc::statvfs(name.as_ptr(), info.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    // SAFETY: successful statvfs initialized the structure.
-    let info = unsafe { info.assume_init() };
-    Ok(u64::from(info.f_bavail).saturating_mul(u64::from(info.f_frsize)))
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub(crate) struct Session {
+    pub high: i64,
+    pub seen: BTreeSet<i64>,
+    pub until: i64,
+}
+#[derive(Default, Serialize, Deserialize)]
+pub(crate) struct Control {
+    pub keys: BTreeSet<String>,
+    pub sessions: BTreeMap<String, Session>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct Raw {
+    pub sample: Sample,
+    pub received: i64,
+    pub provider: String,
+}
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub(crate) struct Aggregate {
+    pub total: f64,
+    pub count: i64,
+}
+pub(crate) type Rollup = BTreeMap<String, Aggregate>;
+pub(crate) type Writes = BTreeMap<String, (String, i64)>;
+
+pub(crate) fn decode<T: DeserializeOwned + Default>(value: &Option<String>) -> Result<T> {
+    value
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map(|v| v.unwrap_or_default())
+        .context("corrupt Redis data")
+}
+pub(crate) fn encoded<T: Serialize>(value: &T) -> Result<String> {
+    let value = serde_json::to_string(value)?;
+    ensure!(
+        value.len() <= MAX_CHUNK_BYTES,
+        "storage chunk capacity exceeded"
+    );
+    Ok(value)
+}
+pub(crate) fn key(generation: &str, kind: &str, node: &str, time: i64) -> String {
+    format!("{ROOT}:{generation}:{kind}:{node}:{time}")
 }
 impl Store {
-    pub async fn open(path: &str, reserve: u64) -> Result<Self> {
-        let opts = SqliteConnectOptions::from_str(path)?
-            .create_if_missing(true)
-            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-            .synchronous(sqlx::sqlite::SqliteSynchronous::Full)
-            .busy_timeout(Duration::from_secs(2))
-            .pragma("max_page_count", "2097152") // 8 GiB at 4096-byte pages
-            .pragma("journal_size_limit", "16777216")
-            .pragma("wal_autocheckpoint", "256");
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(opts)
-            .await?;
-        let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
-            .fetch_one(&pool)
-            .await?;
-        if page_size != 4096 {
-            bail!("database page size must be 4096");
-        }
-        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
-            .fetch_one(&pool)
-            .await?;
-        if version > 2 {
-            bail!("unsupported database schema");
-        }
-        sqlx::query("CREATE TABLE IF NOT EXISTS samples (node TEXT NOT NULL, boot TEXT NOT NULL, process TEXT NOT NULL, seq INTEGER NOT NULL, time INTEGER NOT NULL, received INTEGER NOT NULL, metrics TEXT NOT NULL, gpu TEXT NOT NULL, PRIMARY KEY(node,boot,process,seq))").execute(&pool).await?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS samples_time ON samples(node,time)")
-            .execute(&pool)
-            .await?;
-        sqlx::query("CREATE TABLE IF NOT EXISTS metric_keys (node TEXT NOT NULL, key TEXT NOT NULL, PRIMARY KEY(node,key))").execute(&pool).await?;
-        sqlx::query("CREATE TABLE IF NOT EXISTS rollups (node TEXT NOT NULL, time INTEGER NOT NULL, key TEXT NOT NULL, total REAL NOT NULL, count INTEGER NOT NULL, PRIMARY KEY(node,time,key))").execute(&pool).await?;
-        let mut migration = pool.begin().await?;
-        if version < 2 {
-            sqlx::query("ALTER TABLE samples ADD COLUMN provider TEXT NOT NULL DEFAULT 'native'")
-                .execute(&mut *migration)
-                .await?;
-        }
-        sqlx::query("CREATE TABLE IF NOT EXISTS nodes (uid TEXT PRIMARY KEY,name TEXT NOT NULL,lifecycle TEXT NOT NULL,provider TEXT NOT NULL,capabilities TEXT NOT NULL,first_seen INTEGER NOT NULL,last_seen INTEGER NOT NULL,last_sample INTEGER)").execute(&mut *migration).await?;
-        sqlx::query("CREATE TABLE IF NOT EXISTS registry_status (id INTEGER PRIMARY KEY,error TEXT,cursor INTEGER NOT NULL)").execute(&mut *migration).await?;
-        sqlx::query("INSERT OR IGNORE INTO registry_status VALUES (1,NULL,0)")
-            .execute(&mut *migration)
-            .await?;
-        sqlx::query("PRAGMA user_version=2")
-            .execute(&mut *migration)
-            .await?;
-        migration.commit().await?;
+    pub fn configured(url: &str) -> Result<Self> {
+        let parsed = reqwest::Url::parse(url)?;
+        ensure!(
+            parsed.scheme() == "redis"
+                && parsed.username().is_empty()
+                && parsed.password().is_none()
+                && parsed.path() == "/0"
+                && parsed.query().is_none()
+                && parsed.fragment().is_none()
+                && parsed.host_str().is_some(),
+            "Redis URL must be redis://host:port/0 without credentials or options"
+        );
         Ok(Self {
-            pool,
-            path: path.into(),
-            reserve,
+            client: redis::Client::open(url)?,
         })
     }
-    pub async fn insert(&self, samples: &[Sample]) -> Result<()> {
-        let parent = self
-            .path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        if available(parent)? < self.reserve {
-            bail!("storage reserve reached");
-        }
-        let wal = PathBuf::from(format!("{}-wal", self.path.display()));
-        if std::fs::metadata(wal).is_ok_and(|m| m.len() > 32 * 1024 * 1024) {
-            bail!("WAL pressure");
-        }
-        let mut tx = self.pool.begin().await?;
-        for s in samples {
-            let last: Option<i64> = sqlx::query_scalar(
-                "SELECT max(seq) FROM samples WHERE node=? AND boot=? AND process=?",
-            )
-            .bind(&s.node)
-            .bind(&s.boot_id)
-            .bind(&s.process_id)
-            .fetch_one(&mut *tx)
+    pub async fn connect(url: &str) -> Result<Self> {
+        let store = Self::configured(url)?;
+        store.validate_config().await?;
+        Ok(store)
+    }
+    pub async fn open(url: &str) -> Result<Self> {
+        let store = Self::connect(url).await?;
+        store.initialize().await?;
+        Ok(store)
+    }
+    pub(crate) async fn connection(&self) -> Result<redis::aio::MultiplexedConnection> {
+        Ok(tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.client.get_multiplexed_async_connection(),
+        )
+        .await??)
+    }
+    pub async fn validate_config(&self) -> Result<()> {
+        let mut conn = self.connection().await?;
+        let config: BTreeMap<String, String> = redis::cmd("CONFIG")
+            .arg("GET")
+            .arg(&[
+                "save",
+                "appendonly",
+                "maxmemory-policy",
+                "maxmemory",
+                "databases",
+            ])
+            .query_async(&mut conn)
             .await?;
-            // Out-of-order retry batches are safe: older already-seen identities are ignored.
-            if last.is_some_and(|last| s.seq < last - 12) {
-                bail!("sequence outside retry window");
-            }
-            for key in s.metrics.keys() {
-                sqlx::query("INSERT OR IGNORE INTO metric_keys VALUES (?,?)")
-                    .bind(&s.node)
-                    .bind(key)
-                    .execute(&mut *tx)
-                    .await?;
-            }
-            let keys: i64 = sqlx::query_scalar("SELECT count(*) FROM metric_keys WHERE node=?")
-                .bind(&s.node)
-                .fetch_one(&mut *tx)
-                .await?;
-            if keys > 128 {
-                bail!("persistent metric cardinality exceeded");
-            }
-            let inserted = sqlx::query("INSERT OR IGNORE INTO samples (node,boot,process,seq,time,received,metrics,gpu,provider) VALUES (?,?,?,?,?,?,?,?,coalesce((SELECT provider FROM nodes WHERE uid=?),'native'))")
-                .bind(&s.node)
-                .bind(&s.boot_id)
-                .bind(&s.process_id)
-                .bind(s.seq)
-                .bind(s.timestamp_ms)
-                .bind(now_ms())
-                .bind(serde_json::to_string(&s.metrics)?)
-                .bind(serde_json::to_string(&s.gpu)?)
-                .bind(&s.node)
-                .execute(&mut *tx)
-                .await?
-                .rows_affected();
-            if inserted == 1 {
-                for (key, value) in &s.metrics {
-                    sqlx::query("INSERT INTO rollups VALUES (?,?,?,?,?) ON CONFLICT(node,time,key) DO UPDATE SET total=total+excluded.total,count=count+excluded.count")
-                        .bind(&s.node).bind(s.timestamp_ms / 300_000 * 300_000).bind(key).bind(value.unwrap_or(0.)).bind(i64::from(value.is_some())).execute(&mut *tx).await?;
-                }
-            }
-        }
-        for s in samples {
-            sqlx::query("UPDATE nodes SET last_sample=max(coalesce(last_sample,0),?) WHERE uid=?")
-                .bind(s.timestamp_ms)
-                .bind(&s.node)
-                .execute(&mut *tx)
-                .await?;
-        }
-        tx.commit().await?;
+        ensure!(
+            config.get("save").is_some_and(String::is_empty)
+                && config.get("appendonly").is_some_and(|v| v == "no")
+                && config
+                    .get("maxmemory-policy")
+                    .is_some_and(|v| v == "volatile-lru")
+                && config
+                    .get("maxmemory")
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .is_some_and(|v| v >= 16 * 1024 * 1024),
+            "Redis requires save '', appendonly no, volatile-lru and maxmemory >=16MiB"
+        );
+        let info: String = redis::cmd("INFO")
+            .arg("replication")
+            .query_async(&mut conn)
+            .await?;
+        ensure!(
+            info.lines().any(|l| l.trim() == "role:master"),
+            "Redis must be a dedicated writable primary"
+        );
         Ok(())
+    }
+    async fn initialize(&self) -> Result<()> {
+        let values = self.read(&[ACTIVE.into(), IMPORT.into()]).await?;
+        if values[0].is_none() && values[1].is_none() {
+            self.validate_config().await?;
+            let generation = uuid::Uuid::new_v4().to_string();
+            let mut writes = Writes::new();
+            writes.insert(ACTIVE.into(), (generation.clone(), 0));
+            writes.insert(
+                key(&generation, "registry", "", 0),
+                (encoded(&crate::registry::Registry::default())?, 0),
+            );
+            self.commit(&[ACTIVE.into(), IMPORT.into()], &values, writes)
+                .await?;
+        }
+        Ok(())
+    }
+    pub async fn ready(&self) -> Result<()> {
+        self.registry().await.map(|_| ())
+    }
+    pub(crate) async fn generation(&self) -> Result<String> {
+        self.validate_config().await?;
+        // A Redis restart loses both metrics and control together. Never replay a
+        // cached registry into a new instance; initialize an empty generation.
+        self.initialize().await?;
+        let values = self.read(&[ACTIVE.into(), IMPORT.into()]).await?;
+        ensure!(values[1].is_none(), "history import pending");
+        let generation = values[0].clone().context("storage not initialized")?;
+        ensure!(
+            uuid::Uuid::parse_str(&generation).is_ok(),
+            "unsupported storage generation"
+        );
+        Ok(generation)
+    }
+    pub(crate) async fn read(&self, keys: &[String]) -> Result<Vec<Option<String>>> {
+        ensure!(keys.len() <= 256, "read page too large");
+        if keys.is_empty() {
+            return Ok(vec![]);
+        }
+        Ok(redis::Script::new("#!lua flags=no-writes\nlocal values = {} for i=1,#KEYS do values[i] = redis.call('GET',KEYS[i]) end return values")
+            .key(keys)
+            .invoke_async(&mut self.connection().await?)
+            .await?)
+    }
+    pub(crate) async fn commit(
+        &self,
+        keys: &[String],
+        expected: &[Option<String>],
+        writes: Writes,
+    ) -> Result<bool> {
+        ensure!(
+            keys.len() == expected.len() && writes.len() <= 128,
+            "commit bounds"
+        );
+        let script = redis::Script::new(include_str!("redis_commit.lua"));
+        let mut invocation = script.prepare_invoke();
+        for k in keys {
+            invocation.key(k);
+        }
+        for k in writes.keys() {
+            invocation.key(k);
+        }
+        invocation.arg(keys.len());
+        for v in expected {
+            invocation
+                .arg(if v.is_some() { "1" } else { "0" })
+                .arg(v.as_deref().unwrap_or(""));
+        }
+        invocation.arg(writes.len());
+        for (value, expiry) in writes.values() {
+            ensure!(*expiry >= -1, "invalid expiration");
+            invocation.arg(value).arg(*expiry);
+        }
+        Ok(invocation
+            .invoke_async::<i64>(&mut self.connection().await?)
+            .await?
+            == 1)
+    }
+    pub async fn insert(&self, samples: &[Sample]) -> Result<()> {
+        ensure!(
+            !samples.is_empty() && samples.len() <= 6 && samples.iter().all(|s| s.valid(now_ms())),
+            "invalid batch"
+        );
+        let node = &samples[0].node;
+        ensure!(samples.iter().all(|s| &s.node == node), "mixed Node batch");
+        for _ in 0..8 {
+            let generation = self.generation().await?;
+            let registry_key = key(&generation, "registry", "", 0);
+            let control_key = key(&generation, "control", node, 0);
+            let latest_key = key(&generation, "latest", node, 0);
+            let mut keys = vec![
+                ACTIVE.into(),
+                IMPORT.into(),
+                registry_key.clone(),
+                control_key.clone(),
+                latest_key.clone(),
+            ];
+            for s in samples {
+                keys.push(key(
+                    &generation,
+                    "raw",
+                    node,
+                    s.timestamp_ms / 10_000 * 10_000,
+                ));
+                keys.push(key(
+                    &generation,
+                    "rollup",
+                    node,
+                    s.timestamp_ms / 300_000 * 300_000,
+                ));
+            }
+            keys.sort();
+            keys.dedup();
+            let values = self.read(&keys).await?;
+            let originals: BTreeMap<_, _> =
+                keys.iter().cloned().zip(values.iter().cloned()).collect();
+            ensure!(
+                originals[ACTIVE].as_deref() == Some(&generation) && originals[IMPORT].is_none(),
+                "storage generation changed"
+            );
+            let mut registry: crate::registry::Registry = decode(&originals[&registry_key])?;
+            let registered = registry
+                .nodes
+                .get_mut(node)
+                .context("Node discovery pending")?;
+            ensure!(registered.node.lifecycle == "present", "inactive Node");
+            ensure!(
+                originals[&control_key].is_some() || registered.last_sample.is_none(),
+                "protected Node control missing"
+            );
+            let mut control: Control = decode(&originals[&control_key])?;
+            control
+                .sessions
+                .retain(|_, session| session.until >= now_ms());
+            let mut writes = Writes::new();
+            let mut latest_changed = false;
+            let mut latest: Option<Raw> = originals[&latest_key]
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()?;
+            for s in samples {
+                control.keys.extend(s.metrics.keys().cloned());
+                ensure!(
+                    control.keys.len() <= 128,
+                    "persistent metric cardinality exceeded"
+                );
+                let session_id = format!("{}:{}", s.boot_id, s.process_id);
+                let session = control.sessions.entry(session_id).or_default();
+                ensure!(
+                    s.seq >= session.high.saturating_sub(12),
+                    "sequence outside retry window"
+                );
+                if session.seen.contains(&s.seq) {
+                    continue;
+                }
+                session.high = session.high.max(s.seq);
+                session.seen.insert(s.seq);
+                session
+                    .seen
+                    .retain(|seq| *seq >= session.high.saturating_sub(12));
+                session.until = session.until.max(s.timestamp_ms + RETENTION);
+                ensure!(control.sessions.len() <= 1024, "session capacity exceeded");
+                let raw_key = key(&generation, "raw", node, s.timestamp_ms / 10_000 * 10_000);
+                let raw_value = writes
+                    .get(&raw_key)
+                    .map(|(v, _)| Some(v.clone()))
+                    .unwrap_or_else(|| originals[&raw_key].clone());
+                let mut raw: Vec<Raw> = decode(&raw_value)?;
+                ensure!(raw.len() < 128, "raw chunk capacity exceeded");
+                let record = Raw {
+                    sample: s.clone(),
+                    received: now_ms(),
+                    provider: registered.node.provider.clone(),
+                };
+                raw.push(record.clone());
+                // Expire at chunk START: no sample can exceed the 30-day upper bound.
+                writes.insert(
+                    raw_key,
+                    (encoded(&raw)?, s.timestamp_ms / 10_000 * 10_000 + RETENTION),
+                );
+                let rollup_key = key(
+                    &generation,
+                    "rollup",
+                    node,
+                    s.timestamp_ms / 300_000 * 300_000,
+                );
+                let rollup_value = writes
+                    .get(&rollup_key)
+                    .map(|(v, _)| Some(v.clone()))
+                    .unwrap_or_else(|| originals[&rollup_key].clone());
+                let mut rollup: Rollup = decode(&rollup_value)?;
+                for (name, value) in &s.metrics {
+                    let aggregate = rollup.entry(name.clone()).or_default();
+                    aggregate.total += value.unwrap_or(0.);
+                    aggregate.count = aggregate
+                        .count
+                        .checked_add(i64::from(value.is_some()))
+                        .context("aggregate count overflow")?;
+                    ensure!(aggregate.total.is_finite(), "aggregate overflow");
+                }
+                writes.insert(
+                    rollup_key,
+                    (
+                        encoded(&rollup)?,
+                        s.timestamp_ms / 300_000 * 300_000 + RETENTION,
+                    ),
+                );
+                if s.timestamp_ms >= registered.last_sample.unwrap_or(i64::MIN)
+                    && latest
+                        .as_ref()
+                        .is_none_or(|r| r.sample.timestamp_ms <= s.timestamp_ms)
+                {
+                    latest = Some(record);
+                    latest_changed = true;
+                }
+                registered.last_sample =
+                    Some(registered.last_sample.unwrap_or(0).max(s.timestamp_ms));
+            }
+            if let Some(latest) = latest.filter(|_| latest_changed) {
+                writes.insert(
+                    latest_key,
+                    (encoded(&latest)?, latest.sample.timestamp_ms + RETENTION),
+                );
+            }
+            writes.insert(control_key, (encoded(&control)?, 0));
+            writes.insert(registry_key, (encoded(&registry)?, 0));
+            if self.commit(&keys, &values, writes).await? {
+                return Ok(());
+            }
+        }
+        bail!("storage contention")
     }
     pub async fn retain(&self) -> Result<()> {
-        self.maintain_registry().await?;
-        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+        self.maintain_registry().await.map(|_| ())
     }
     pub async fn history(&self, node: &str, hours: u32) -> Result<History> {
+        ensure!((1..=720).contains(&hours), "invalid history range");
+        let generation = self.generation().await?;
+        ensure!(self.has_uid(node).await?, "unknown Node");
         let end = now_ms();
         let start = end - i64::from(hours) * 3_600_000;
         let bucket = if hours > 6 {
@@ -181,290 +385,125 @@ impl Store {
         } else {
             ((i64::from(hours) * 3_600_000 + 1198) / 1199).max(10_000)
         };
-        // Persistent five-minute aggregates bound long-range queries; raw samples preserve short gaps.
-        let rows = if hours > 6 {
-            sqlx::query("SELECT ((time-?)/?) AS bucket, key, sum(total)/nullif(sum(count),0) AS value FROM rollups WHERE node=? AND time>=? AND time<=? GROUP BY bucket,key ORDER BY bucket LIMIT 153600")
-                .bind(start).bind(bucket).bind(node).bind(start).bind(end).fetch_all(&self.pool).await?
-        } else {
-            sqlx::query("SELECT ((time-?)/?) AS bucket, j.key AS key, avg(CASE WHEN j.type IN ('integer','real') THEN j.value END) AS value FROM samples, json_each(samples.metrics) j WHERE node=? AND time>=? AND time<=? GROUP BY bucket,j.key ORDER BY bucket LIMIT 153600")
-                .bind(start).bind(bucket).bind(node).bind(start).bind(end).fetch_all(&self.pool).await?
-        };
-        let mut points = BTreeMap::<i64, Metrics>::new();
-        for row in rows {
-            let index: i64 = row.try_get("bucket")?;
-            points
-                .entry(index)
-                .or_default()
-                .insert(row.try_get("key")?, row.try_get("value")?);
-        }
-        // Explicit empty buckets mark missing observations, never fabricated zeroes.
-        let points = (0..=((end - start) / bucket))
-            .map(|i| Point {
-                timestamp_ms: start + i * bucket,
-                metrics: points.remove(&i).unwrap_or_default(),
-                gpu: None,
-            })
+        let step = if hours > 6 { 300_000 } else { 10_000 };
+        let kind = if hours > 6 { "rollup" } else { "raw" };
+        let keys: Vec<_> = (start / step..=end / step)
+            .map(|i| key(&generation, kind, node, i * step))
             .collect();
+        let mut points = BTreeMap::<i64, Rollup>::new();
+        let mut bytes = 0;
+        for page in keys.chunks(128) {
+            let values = self.read(page).await?;
+            for (chunk_key, value) in page.iter().zip(values) {
+                let Some(value) = value else {
+                    continue;
+                };
+                bytes += value.len();
+                ensure!(
+                    bytes <= MAX_QUERY_BYTES && value.len() <= MAX_CHUNK_BYTES,
+                    "query byte budget exceeded"
+                );
+                if hours > 6 {
+                    let time: i64 = chunk_key
+                        .rsplit(':')
+                        .next()
+                        .context("chunk time")?
+                        .parse()?;
+                    if time < start || time > end {
+                        continue;
+                    }
+                    let rollup: Rollup = serde_json::from_str(&value)?;
+                    merge(points.entry((time - start) / bucket).or_default(), &rollup)?;
+                } else {
+                    let raw: Vec<Raw> = serde_json::from_str(&value)?;
+                    ensure!(raw.len() <= 128, "raw chunk capacity exceeded");
+                    for r in raw {
+                        if r.sample.timestamp_ms < start || r.sample.timestamp_ms > end {
+                            continue;
+                        }
+                        let rollup = r
+                            .sample
+                            .metrics
+                            .into_iter()
+                            .map(|(k, v)| {
+                                (
+                                    k,
+                                    Aggregate {
+                                        total: v.unwrap_or(0.),
+                                        count: i64::from(v.is_some()),
+                                    },
+                                )
+                            })
+                            .collect();
+                        merge(
+                            points
+                                .entry((r.sample.timestamp_ms - start) / bucket)
+                                .or_default(),
+                            &rollup,
+                        )?;
+                    }
+                }
+            }
+        }
+        ensure!(
+            self.generation().await? == generation,
+            "storage generation changed"
+        );
         Ok(History {
             node: node.into(),
             bucket_ms: bucket,
-            points,
+            points: (0..=(end - start) / bucket)
+                .map(|i| Point {
+                    timestamp_ms: start + i * bucket,
+                    metrics: points
+                        .remove(&i)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(k, a)| {
+                            (
+                                k,
+                                if a.count == 0 {
+                                    None
+                                } else {
+                                    Some(a.total / a.count as f64)
+                                },
+                            )
+                        })
+                        .collect(),
+                    gpu: None,
+                })
+                .collect(),
         })
     }
     pub async fn latest(&self, node: &str) -> Result<Option<Point>> {
-        let row = sqlx::query(
-            "SELECT time,metrics,gpu FROM samples WHERE node=? ORDER BY time DESC LIMIT 1",
-        )
-        .bind(node)
-        .fetch_optional(&self.pool)
-        .await?;
-        row.map(|r| {
-            Ok(Point {
-                timestamp_ms: r.try_get("time")?,
-                metrics: serde_json::from_str(r.try_get("metrics")?)?,
-                gpu: Some(serde_json::from_str(r.try_get("gpu")?)?),
-            })
-        })
-        .transpose()
+        let generation = self.generation().await?;
+        let value = self
+            .read(&[key(&generation, "latest", node, 0)])
+            .await?
+            .remove(0);
+        let raw: Option<Raw> = value.as_deref().map(serde_json::from_str).transpose()?;
+        Ok(raw.map(|r| Point {
+            timestamp_ms: r.sample.timestamp_ms,
+            metrics: r.sample.metrics,
+            gpu: Some(r.sample.gpu),
+        }))
     }
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[tokio::test]
-    async fn persistence_dedup_restart() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let path = dir.path().join("db.sqlite3");
-        let path = path.to_str().ok_or_else(|| anyhow::anyhow!("path"))?;
-        let s = Sample {
-            node: "alpha".into(),
-            boot_id: uuid::Uuid::new_v4().to_string(),
-            process_id: uuid::Uuid::new_v4().to_string(),
-            seq: 0,
-            timestamp_ms: now_ms(),
-            gpu: GpuStatus::default(),
-            metrics: BTreeMap::from([("cpu.used_percent".into(), Some(42.))]),
-        };
-        let store = Store::open(path, 0).await?;
-        store.insert(&[s.clone(), s]).await?;
-        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM samples")
-            .fetch_one(&store.pool)
-            .await?;
-        assert_eq!(count, 1);
-        store.pool.close().await;
-        let store = Store::open(path, 0).await?;
-        assert!(store.latest("alpha").await?.is_some());
-        let history = store.history("alpha", 720).await?;
-        assert!(history.points.len() <= 1200);
-        assert!(history.points.iter().any(|p| p.metrics.is_empty()));
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod safety_tests {
-    use super::*;
-    fn sample(seq: i64) -> Sample {
-        Sample {
-            node: "alpha".into(),
-            boot_id: uuid::Uuid::nil().to_string(),
-            process_id: uuid::Uuid::nil().to_string(),
-            seq,
-            timestamp_ms: now_ms(),
-            metrics: BTreeMap::from([("cpu.used_percent".into(), Some(42.))]),
-            gpu: GpuStatus::default(),
-        }
-    }
-    #[tokio::test]
-    async fn retention_uses_node_time_indexes_with_full_retained_history() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let path = dir.path().join("retention.sqlite3");
-        let store = Store::open(path.to_str().ok_or_else(|| anyhow::anyhow!("path"))?, 0).await?;
-        sqlx::query("INSERT INTO metric_keys VALUES ('alpha','cpu.used_percent'),('gamma','cpu.used_percent')").execute(&store.pool).await?;
-        let now = now_ms();
-        // Same full 30-day sample count, narrow payload: maintenance depends on row count,
-        // not on metric width. Do not regenerate the multi-GiB history/load fixture.
-        sqlx::query("WITH RECURSIVE n(i) AS (VALUES(0) UNION ALL SELECT i+1 FROM n WHERE i<518399) INSERT INTO samples (node,boot,process,seq,time,received,metrics,gpu) SELECT CASE WHEN i%2=0 THEN 'alpha' ELSE 'gamma' END,'boot','process',i,?- (i/2)*9990,?,'{}','{}' FROM n")
-            .bind(now).bind(now).execute(&store.pool).await?;
-        sqlx::query("WITH RECURSIVE n(i) AS (VALUES(0) UNION ALL SELECT i+1 FROM n WHERE i<17279) INSERT INTO rollups SELECT CASE WHEN i%2=0 THEN 'alpha' ELSE 'gamma' END,?-(i/2)*299000,'cpu.used_percent',42,1 FROM n")
-            .bind(now).execute(&store.pool).await?;
-        for table in ["samples", "rollups"] {
-            let plan = sqlx::query(&format!(
-                "EXPLAIN QUERY PLAN SELECT rowid FROM {table} WHERE node=? AND time < ? LIMIT 500"
-            ))
-            .bind("alpha")
-            .bind(now - 30 * 86400 * 1000)
-            .fetch_all(&store.pool)
-            .await?;
-            let details: Vec<String> = plan
-                .iter()
-                .map(|row| row.try_get("detail"))
-                .collect::<Result<_, _>>()?;
-            assert!(
-                details
-                    .iter()
-                    .any(|d| d.contains("SEARCH") && d.contains("node=? AND time<?")),
-                "{table}: {details:?}"
-            );
-            assert!(
-                !details.iter().any(|d| d.contains("SCAN")),
-                "{table}: {details:?}"
-            );
-            eprintln!("retention {table} plan: {details:?}");
-        }
-        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .execute(&store.pool)
-            .await?;
-        let before = std::time::Instant::now();
-        store.retain().await?;
-        let elapsed = before.elapsed();
-        eprintln!("no-expiry retention with 518400 samples and 17280 rollups: {elapsed:?}");
-        assert!(elapsed < Duration::from_secs(2));
-        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM samples")
-            .fetch_one(&store.pool)
-            .await?;
-        assert_eq!(count, 518400);
-        Ok(())
-    }
-    #[tokio::test]
-    async fn retention_rollup_dedup_and_cardinality_rollback() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let store = Store::open(
-            dir.path()
-                .join("db")
-                .to_str()
-                .ok_or_else(|| anyhow::anyhow!("path"))?,
-            0,
-        )
-        .await?;
-        let mut old = sample(0);
-        old.timestamp_ms -= 31 * 86400 * 1000;
-        store.insert(&[old.clone(), old]).await?;
-        let count: i64 = sqlx::query_scalar("SELECT sum(count) FROM rollups")
-            .fetch_one(&store.pool)
-            .await?;
-        assert_eq!(count, 1);
-        store.retain().await?;
-        assert!(store.latest("alpha").await?.is_none());
-        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM rollups")
-            .fetch_one(&store.pool)
-            .await?;
-        assert_eq!(count, 0);
-        let mut full = sample(1);
-        for i in 0..127 {
-            full.metrics.insert(format!("net.metric{i}"), Some(1.));
-        }
-        store.insert(&[full]).await?;
-        let mut overflow = sample(2);
-        overflow.metrics.insert("net.extra".into(), Some(1.));
-        assert!(store.insert(&[overflow]).await.is_err());
-        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM metric_keys")
-            .fetch_one(&store.pool)
-            .await?;
-        assert_eq!(count, 128);
-        Ok(())
-    }
-    #[tokio::test]
-    async fn sqlite_full_rolls_back_and_reopens() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let path = dir.path().join("db");
-        let path = path.to_str().ok_or_else(|| anyhow::anyhow!("path"))?;
-        let store = Store::open(path, 0).await?;
-        store.insert(&[sample(0)]).await?;
-        let pages: i64 = sqlx::query_scalar("PRAGMA page_count")
-            .fetch_one(&store.pool)
-            .await?;
-        sqlx::query(&format!("PRAGMA max_page_count={pages}"))
-            .execute(&store.pool)
-            .await?;
-        let mut huge = sample(1);
-        for i in 0..127 {
-            huge.metrics
-                .insert(format!("net.{}.{i}", "x".repeat(80)), Some(1.));
-        }
-        assert!(store.insert(&[huge]).await.is_err());
-        store.pool.close().await;
-        let store = Store::open(path, 0).await?;
-        assert_eq!(
-            store
-                .latest("alpha")
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("sample missing"))?
-                .metrics
-                .len(),
-            1
+fn merge(target: &mut Rollup, source: &Rollup) -> Result<()> {
+    ensure!(source.len() <= 128, "aggregate cardinality exceeded");
+    for (key, value) in source {
+        ensure!(
+            value.total.is_finite() && value.total >= 0. && value.count >= 0,
+            "corrupt aggregate"
         );
-        Ok(())
+        let entry = target.entry(key.clone()).or_default();
+        entry.total += value.total;
+        entry.count = entry
+            .count
+            .checked_add(value.count)
+            .context("aggregate count overflow")?;
+        ensure!(entry.total.is_finite(), "aggregate overflow");
     }
-    #[tokio::test]
-    #[ignore = "30-day representative load/size fixture; run explicitly"]
-    async fn thirty_day_size_and_rollup_latency() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let path = dir.path().join("load.sqlite3");
-        let path = path.to_str().ok_or_else(|| anyhow::anyhow!("path"))?;
-        let store = Store::open(path, 0).await?;
-        let metrics: Metrics = (0..64)
-            .map(|i| (format!("net.interface_metric_{i}"), Some(123456789.25)))
-            .collect();
-        let json = serde_json::to_string(&metrics)?;
-        let start = now_ms() - 30 * 86400 * 1000;
-        let before = std::time::Instant::now();
-        sqlx::query("WITH RECURSIVE n(i) AS (VALUES(0) UNION ALL SELECT i+1 FROM n WHERE i<518399) INSERT INTO samples (node,boot,process,seq,time,received,metrics,gpu) SELECT CASE WHEN i%2=0 THEN 'alpha' ELSE 'gamma' END,'boot','process',i,?+(i/2)*10000,?,?,'{}' FROM n")
-            .bind(start).bind(now_ms()).bind(json).execute(&store.pool).await?;
-        sqlx::query("INSERT INTO rollups SELECT node,(time/300000)*300000,j.key,sum(j.value),count(j.value) FROM samples,json_each(samples.metrics) j GROUP BY node,(time/300000),j.key").execute(&store.pool).await?;
-        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .execute(&store.pool)
-            .await?;
-        let size = std::fs::metadata(path)?.len();
-        let query = std::time::Instant::now();
-        let history = store.history("alpha", 720).await?;
-        let latency = query.elapsed();
-        eprintln!(
-            "518400 samples, 64 metrics: bytes={size}, build={:?}, history={latency:?}, points={}",
-            before.elapsed(),
-            history.points.len()
-        );
-        assert!(size < 8 * 1024 * 1024 * 1024);
-        assert!(latency < Duration::from_secs(5));
-        assert!(history.points.len() <= 1200);
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod wal_recovery_tests {
-    use super::*;
-    #[tokio::test]
-    async fn committed_wal_survives_crash_snapshot() -> Result<()> {
-        let source = tempfile::tempdir()?;
-        let recovered = tempfile::tempdir()?;
-        let path = source.path().join("db");
-        let path = path.to_str().ok_or_else(|| anyhow::anyhow!("path"))?;
-        let store = Store::open(path, 0).await?;
-        let sample = Sample {
-            node: "gamma".into(),
-            boot_id: uuid::Uuid::nil().to_string(),
-            process_id: uuid::Uuid::nil().to_string(),
-            seq: 0,
-            timestamp_ms: now_ms(),
-            metrics: BTreeMap::new(),
-            gpu: GpuStatus::default(),
-        };
-        store.insert(&[sample]).await?;
-        // Copy only durable database+WAL at a quiescent committed boundary, no SHM.
-        // This models reopening after loss of the process and its shared-memory index.
-        std::fs::copy(path, recovered.path().join("db"))?;
-        std::fs::copy(format!("{path}-wal"), recovered.path().join("db-wal"))?;
-        let db = Store::open(
-            recovered
-                .path()
-                .join("db")
-                .to_str()
-                .ok_or_else(|| anyhow::anyhow!("path"))?,
-            0,
-        )
-        .await?;
-        assert!(db.latest("gamma").await?.is_some());
-        Ok(())
-    }
+    ensure!(target.len() <= 128, "aggregate cardinality exceeded");
+    Ok(())
 }

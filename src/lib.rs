@@ -8,3 +8,5 @@ pub mod web;
 
 pub mod kubernetes;
 pub mod registry;
+
+pub mod import;
